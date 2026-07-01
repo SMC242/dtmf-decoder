@@ -20,7 +20,12 @@ Originally inspired by [this Reddit post](https://www.reddit.com/r/explainlikeim
 
 ## Plan
 
-- [ ] Support a limited-duration audio file, returning a list of keys pressed
+- [ ] Support a limited-duration audio file (.ogg, opus codec), returning a list of keys pressed
   - Take sampling rate as a parameter initially
   - [ ] Add support for reading the sampling rate from the file metadata
 - [ ] Support real-time classification, updating the keys pressed every 80ms
+- [ ] Wrap the program in a simple website so people can play with it without any setup
+
+## Bells and whistles
+
+- [ ] Support the [AMR-WB codec](https://en.wikipedia.org/wiki/Adaptive_Multi-Rate_Wideband) which is used for real cellular calls. Opus is optimised for the web
