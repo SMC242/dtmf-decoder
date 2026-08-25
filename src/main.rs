@@ -1,5 +1,6 @@
 use ogg::reading as ogg;
 use std::fs;
+use std::io::{Read, Seek};
 use std::num::NonZeroU8;
 use std::path::Path;
 
@@ -15,6 +16,9 @@ pub enum SamplingRate {
     Mediumband = 12_000,
     Wideband = 16_000,
     SuperWideband = 24_000,
+    // NOTE: not officially supported. The decoder will upsample this
+    // See https://github.com/xiph/opus/issues/43
+    Cd = 44_100,
     Fullband = 48_000,
 }
 
@@ -33,6 +37,7 @@ impl TryFrom<u32> for SamplingRate {
             SamplingRate::Mediumband,
             SamplingRate::Wideband,
             SamplingRate::SuperWideband,
+            SamplingRate::Cd,
             SamplingRate::Fullband,
         ];
         ALL.iter().find(|&variant| variant.to_hertz() == value).copied()
@@ -78,11 +83,7 @@ pub fn decode_timeslice(
     while total_samples < expected_samples {
         match stream.read_packet() {
             Ok(Some(packet)) => {
-                dbg!(&packet.data);
                 let mut packet_data: Vec<i16> = vec![0; packet.data.len()];
-                dbg!(&packet_data);
-                println!("{0:x?}", packet.data);
-                dbg!(packet.data.len(), packet_data.len());
 
                 let frame_size = decoder
                     .decode(&packet.data, &mut packet_data, DECODE_FEC)
@@ -120,6 +121,7 @@ pub enum OpusHeaderParseError {
     /// 5.1 surround sound is unlikely in this case and channel family 255 shouldn't be used by
     /// "general-purpose players". See https://www.rfc-editor.org/info/rfc7845/#section-5.1.1.1
     UnsupportedChannelFamily,
+    NotOpus,
 }
 
 fn read_multi_byte<const N: usize, T, E, F: FnOnce([u8; N]) -> T>(
@@ -130,39 +132,88 @@ fn read_multi_byte<const N: usize, T, E, F: FnOnce([u8; N]) -> T>(
     <[u8; N]>::try_from(bytes).map_err(|_| err).map(converter)
 }
 
+fn read_opus_field<const N: usize, T, F: FnOnce([u8; N]) -> T, R: std::io::Read>(
+    converter: F,
+    err_msg: &'static str,
+    cur: &mut R,
+) -> Result<T, OpusHeaderParseError> {
+    let mut buf = [0u8; N];
+    cur.read_exact(&mut buf)
+        .or(Err(OpusHeaderParseError::MalformedOpusHead(
+            err_msg.to_string(),
+        )))?;
+    Ok(converter(buf))
+}
+
+fn read_opus_field_single<T, F: FnOnce(u8) -> T, R: std::io::Read>(
+    converter: F,
+    err_msg: &'static str,
+    cur: &mut R,
+) -> Result<T, OpusHeaderParseError> {
+    read_opus_field(|xs: [u8; 1]| converter(xs[0]), err_msg, cur)
+}
+
+fn offset_opus_cursor<R: std::io::Seek>(
+    offset: i64,
+    err_msg: &'static str,
+    cur: &mut R,
+) -> Result<(), OpusHeaderParseError> {
+    cur.seek_relative(offset)
+        .or(Err(OpusHeaderParseError::MalformedOpusHead(
+            err_msg.to_string(),
+        )))?;
+    Ok(())
+}
+
 fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
     reader: &mut ogg::PacketReader<T>,
 ) -> Result<OpusStreamMetadata, OpusHeaderParseError> {
     let opus_head_packet = reader
         .read_packet()
         .map_err(OpusHeaderParseError::ReadFailed)
-        .map(|p| p.ok_or(OpusHeaderParseError::MissingOpusHead))??;
+        .map(|p| {
+            let res = p.ok_or(OpusHeaderParseError::MissingOpusHead);
+            res
+        })??;
 
-    // Ignore the minor version as required by the RFC
-    let version = opus_head_packet.data[1] & 0b11110000;
-    if version != 1 {
-        return Err(OpusHeaderParseError::UnsupportedVersion(version));
+    // Not an Opus packet
+    if !opus_head_packet.data.starts_with(b"OpusHead") {
+        return Err(OpusHeaderParseError::NotOpus);
     }
 
-    let channel_count = NonZeroU8::try_from(opus_head_packet.data[2]).map_err(|_| {
-        OpusHeaderParseError::MalformedOpusHead("Invalid channel count: 0".to_string())
-    })?;
+    let mut cur = std::io::Cursor::new(opus_head_packet.data);
+
+    // Cursor magic from https://github.com/karx1/opusmeta/blob/master/src/lib.rs#L242
+    offset_opus_cursor(8, "Unexpected EOF at OpusHead version", &mut cur)?;
+    let major_version_raw =
+        read_opus_field_single(u8::from_le, "Unexpected EOF at OpusHead version", &mut cur)?;
+    // Ignore the minor version as required by the RFC
+    let major_version = major_version_raw & 0b00001111;
+    if major_version != 1 {
+        return Err(OpusHeaderParseError::UnsupportedVersion(major_version));
+    }
+
+    let channel_count = read_opus_field_single(
+        |x| {
+            NonZeroU8::try_from(x).or(Err(OpusHeaderParseError::MalformedOpusHead(
+                "Channel count can't be 0".to_string(),
+            )))
+        },
+        "Missing channel count",
+        &mut cur,
+    )??;
 
     // All mutli-byte values will be little endian due to RFC
-    let preskip = read_multi_byte(
+    let preskip = read_opus_field(
         u16::from_le_bytes,
-        OpusHeaderParseError::MalformedOpusHead(
-            "Unexpected end of stream in preskip header".to_string(),
-        ),
-        &opus_head_packet.data[3..4],
+        "Unexpected end of stream in preskip header",
+        &mut cur,
     )?;
 
-    let input_sample_rate_hz = read_multi_byte(
+    let input_sample_rate_hz = read_opus_field(
         u32::from_le_bytes,
-        OpusHeaderParseError::MalformedOpusHead(
-            "Unexpected end of stream in input sample rate header".to_string(),
-        ),
-        &opus_head_packet.data[5..9],
+        "Unexpected end of stream in input sample rate header",
+        &mut cur,
     )?;
     let sampling_rate = SamplingRate::try_from(input_sample_rate_hz).or(Err(
         OpusHeaderParseError::MalformedOpusHead(format!(
@@ -170,15 +221,15 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
         )),
     ))?;
 
-    let output_gain_db = read_multi_byte(
+    let output_gain_db = read_opus_field(
         i16::from_le_bytes,
-        OpusHeaderParseError::MalformedOpusHead(
-            "Unexpected end of stream in output gain header".to_string(),
-        ),
-        &opus_head_packet.data[9..13],
+        "Unexpected end of stream in output gain header",
+        &mut cur,
     )?;
 
-    let _channel_mapping_family = match opus_head_packet.data[14] {
+    let channel_mapping_family_raw =
+        read_opus_field_single(u8::from_le, "Missing channel mapping family", &mut cur)?;
+    let _channel_mapping_family = match channel_mapping_family_raw {
         0 => 0,
         1.. => return Err(OpusHeaderParseError::UnsupportedChannelFamily),
     };
@@ -193,7 +244,7 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
         .map_err(OpusHeaderParseError::ReadFailed)
         .map(|p| p.ok_or(OpusHeaderParseError::MissingOpusTags))??;
     Ok(OpusStreamMetadata {
-        version,
+        version: major_version,
         channel_count,
         preskip,
         input_sample_rate_hz: sampling_rate,
@@ -206,11 +257,13 @@ fn main() -> Result<(), DecodeDtmfError> {
     let sampling_rate = SamplingRate::Fullband;
 
     let u32_sampling_rate = u32::from(sampling_rate as u16);
-    // Stereo also from inspection
-    let mut decoder = opus::Decoder::new(u32_sampling_rate, opus::Channels::Stereo)
+    // Mono always because phone mic audio is expected. If it happens to be unexpected
+    // audio (E.G a song), the decoder will just demux the stream
+    let mut decoder = opus::Decoder::new(u32_sampling_rate, opus::Channels::Mono)
         .expect("Initialising the decoder should succeed");
     let mut stream = read_ogg(Path::new(FILE_PATH)).map_err(DecodeDtmfError::IoError)?;
 
+    println!("Parsing headers");
     let stream_meta = parse_opus_headers(&mut stream).map_err(DecodeDtmfError::OpusParseError)?;
     dbg!(stream_meta);
 
