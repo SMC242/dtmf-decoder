@@ -1,3 +1,4 @@
+use ::ogg::PacketReader;
 use ogg::reading as ogg;
 use std::fs;
 use std::io::{Read, Seek};
@@ -84,6 +85,8 @@ pub fn decode_timeslice(
         match stream.read_packet() {
             Ok(Some(packet)) => {
                 let mut packet_data: Vec<i16> = vec![0; packet.data.len()];
+                dbg!(packet.data.len());
+                dbg!(packet_data.len());
 
                 let frame_size = decoder
                     .decode(&packet.data, &mut packet_data, DECODE_FEC)
@@ -122,14 +125,6 @@ pub enum OpusHeaderParseError {
     /// "general-purpose players". See https://www.rfc-editor.org/info/rfc7845/#section-5.1.1.1
     UnsupportedChannelFamily,
     NotOpus,
-}
-
-fn read_multi_byte<const N: usize, T, E, F: FnOnce([u8; N]) -> T>(
-    converter: F,
-    err: E,
-    bytes: &[u8],
-) -> Result<T, E> {
-    <[u8; N]>::try_from(bytes).map_err(|_| err).map(converter)
 }
 
 fn read_opus_field<const N: usize, T, F: FnOnce([u8; N]) -> T, R: std::io::Read>(
@@ -171,10 +166,7 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
     let opus_head_packet = reader
         .read_packet()
         .map_err(OpusHeaderParseError::ReadFailed)
-        .map(|p| {
-            let res = p.ok_or(OpusHeaderParseError::MissingOpusHead);
-            res
-        })??;
+        .map(|p| p.ok_or(OpusHeaderParseError::MissingOpusHead))??;
 
     // Not an Opus packet
     if !opus_head_packet.data.starts_with(b"OpusHead") {
@@ -238,11 +230,12 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
     // which should be okay according to https://www.rfc-editor.org/info/rfc7845/#section-5.1.1
     // Phone audio is unlikely to be stereo anyway
 
-    // TODO: skip the OpusTags. Not important for this application
+    // Skip the tags as that metadata isn't useful
     let _tags_packet = reader
         .read_packet()
         .map_err(OpusHeaderParseError::ReadFailed)
         .map(|p| p.ok_or(OpusHeaderParseError::MissingOpusTags))??;
+
     Ok(OpusStreamMetadata {
         version: major_version,
         channel_count,
@@ -250,6 +243,79 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
         input_sample_rate_hz: sampling_rate,
         output_gain_db,
     })
+}
+
+fn do_preskip<T: Read + Seek>(
+    headers: &OpusStreamMetadata,
+    decoder: &mut opus::Decoder,
+    stream: &mut PacketReader<T>,
+) {
+}
+
+fn calc_max_frame_size(sampling_rate: u32, channels: opus::Channels) -> usize {
+    // The longest packets are 120ms
+    const LONGEST_PACKET: std::time::Duration = std::time::Duration::from_millis(120);
+    let samples_per_channel = (u32::try_from(LONGEST_PACKET.as_millis())
+        .expect("Packet duration is small enough")
+        * sampling_rate)
+        / 1000;
+    usize::try_from(samples_per_channel * channels as u32)
+        .expect("The samples per channel should fit in usize")
+}
+
+fn read_opus_packet<T: Read + Seek>(
+    max_frame_size: usize,
+    decoder: &mut opus::Decoder,
+    stream: &mut PacketReader<T>,
+) -> Result<(), DecodeDtmfError> {
+    while let Some(packet) = stream.read_packet().transpose() {
+        match packet {
+            Ok(p) => {
+                // println!("packet data: {0:x?}", &p.data);
+                let mut output = vec![0; max_frame_size];
+                match decoder.decode(&p.data, &mut output, false) {
+                    Ok(samples_decoded) => {
+                        println!("Packet data: {0:x?}", &output[0..samples_decoded])
+                    }
+                    Err(err) => {
+                        dbg!(err);
+                    }
+                }
+            }
+            Err(err) => {
+                dbg!(err);
+            }
+        }
+    }
+}
+
+fn print_packets<T: Read + Seek>(decoder: &mut opus::Decoder, stream: &mut PacketReader<T>) {
+    let max_frame_size = calc_max_frame_size(
+        decoder
+            .get_sample_rate()
+            .expect("Can get sampling rate from Opus decoder"),
+        opus::Channels::Mono,
+    );
+
+    while let Some(packet) = stream.read_packet().transpose() {
+        match packet {
+            Ok(p) => {
+                // println!("packet data: {0:x?}", &p.data);
+                let mut output = vec![0; max_frame_size];
+                match decoder.decode(&p.data, &mut output, false) {
+                    Ok(samples_decoded) => {
+                        println!("Packet data: {0:x?}", &output[0..samples_decoded])
+                    }
+                    Err(err) => {
+                        dbg!(err);
+                    }
+                }
+            }
+            Err(err) => {
+                dbg!(err);
+            }
+        }
+    }
 }
 
 fn main() -> Result<(), DecodeDtmfError> {
@@ -266,6 +332,8 @@ fn main() -> Result<(), DecodeDtmfError> {
     println!("Parsing headers");
     let stream_meta = parse_opus_headers(&mut stream).map_err(DecodeDtmfError::OpusParseError)?;
     dbg!(stream_meta);
+
+    print_packets(&mut decoder, &mut stream);
 
     let first_10s = decode_timeslice(
         sampling_rate,
