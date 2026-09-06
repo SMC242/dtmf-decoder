@@ -1,12 +1,14 @@
 use ::ogg::PacketReader;
 use ogg::reading as ogg;
 use std::fs;
-use std::io::{Read, Seek};
+use std::io::{Error as IoError, Read, Seek};
 use std::num::NonZeroU8;
 use std::path::Path;
 
 // From https://opus-codec.org/examples/
 const FILE_PATH: &str = "/home/eilidhm/Downloads/ehren-paper_lights-96.opus";
+
+type OpusSamples = [i16];
 
 /// Sampling rate in Hertz
 /// NOTE: the Opus codec only supports these sampling rates
@@ -48,20 +50,16 @@ impl TryFrom<u32> for SamplingRate {
 
 #[derive(Debug)]
 enum DecodeDtmfError {
-    IoError(std::io::Error),
-    SignalReadError(DecodeTimesliceError),
+    IoError(IoError),
     OpusParseError(OpusHeaderParseError),
+    OpusDecodeError(opus::Error),
+    OggFormatError(ogg::OggReadError),
+    EndOfStream,
 }
 
 type SignalSlice = Vec<i16>;
 
-#[derive(Debug)]
-pub enum DecodeTimesliceError {
-    DecodeError(opus::Error),
-    OggFormatError(ogg::OggReadError),
-}
-
-pub fn read_ogg(path: &Path) -> Result<ogg::PacketReader<fs::File>, std::io::Error> {
+pub fn read_ogg(path: &Path) -> Result<ogg::PacketReader<fs::File>, IoError> {
     let file = fs::File::open(path)?;
     Ok(ogg::PacketReader::new(file))
 }
@@ -74,7 +72,7 @@ pub fn decode_timeslice(
     timeslice: std::time::Duration,
     decoder: &mut opus::Decoder,
     stream: &mut ogg::PacketReader<fs::File>,
-) -> Result<SignalSlice, DecodeTimesliceError> {
+) -> Result<SignalSlice, DecodeDtmfError> {
     const DECODE_FEC: bool = false;
 
     let mut signal = Vec::new();
@@ -90,13 +88,13 @@ pub fn decode_timeslice(
 
                 let frame_size = decoder
                     .decode(&packet.data, &mut packet_data, DECODE_FEC)
-                    .map_err(DecodeTimesliceError::DecodeError)?;
+                    .map_err(DecodeDtmfError::OpusDecodeError)?;
                 total_samples += u64::try_from(frame_size)
                     .expect("Converting sample count to u64 should be ok on 64-bit systems");
                 signal.extend(packet_data);
             }
             Ok(None) => return Ok(signal),
-            Err(err) => return Err(DecodeTimesliceError::OggFormatError(err)),
+            Err(err) => return Err(DecodeDtmfError::OggFormatError(err)),
         };
     }
     Ok(signal)
@@ -108,7 +106,7 @@ pub fn decode_timeslice(
 pub struct OpusStreamMetadata {
     pub version: u8,
     pub channel_count: NonZeroU8,
-    pub preskip: u16,
+    pub preskip: usize,
     pub input_sample_rate_hz: SamplingRate,
     pub output_gain_db: i16,
 }
@@ -167,6 +165,7 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
         .read_packet()
         .map_err(OpusHeaderParseError::ReadFailed)
         .map(|p| p.ok_or(OpusHeaderParseError::MissingOpusHead))??;
+    println!("OpusHead packet raw: {0:x?}", &opus_head_packet.data);
 
     // Not an Opus packet
     if !opus_head_packet.data.starts_with(b"OpusHead") {
@@ -239,53 +238,70 @@ fn parse_opus_headers<T: std::io::Read + std::io::Seek>(
     Ok(OpusStreamMetadata {
         version: major_version,
         channel_count,
-        preskip,
+        preskip: preskip.into(),
         input_sample_rate_hz: sampling_rate,
         output_gain_db,
     })
 }
 
+// Skip the number of samples in `headers.preskip`
+// May return some decoded samples if the preskip ends mid-packet
+// See https://www.rfc-editor.org/info/rfc7845/#section-4.2
 fn do_preskip<T: Read + Seek>(
     headers: &OpusStreamMetadata,
+    buffer: &mut OpusSamples,
     decoder: &mut opus::Decoder,
     stream: &mut PacketReader<T>,
-) {
+) -> Result<Option<Vec<i16>>, DecodeDtmfError> {
+    println!("Doing preskip for {0} samples", headers.preskip);
+
+    let mut samples_seen: usize = 0;
+    let mut res = read_opus_packet(buffer, decoder, stream);
+    while let Ok(slice) = res
+        && samples_seen <= headers.preskip
+    {
+        samples_seen += slice.len();
+        println!("Skipping samples {slice:x?}");
+        res = read_opus_packet(buffer, decoder, stream);
+    }
+
+    res.map(|slice| {
+        let extra_samples = samples_seen - headers.preskip;
+        if extra_samples > 0 {
+            Some(slice.iter().copied().rev().take(extra_samples).collect())
+        } else {
+            None
+        }
+    })
 }
 
 fn calc_max_frame_size(sampling_rate: u32, channels: opus::Channels) -> usize {
     // The longest packets are 120ms
-    const LONGEST_PACKET: std::time::Duration = std::time::Duration::from_millis(120);
-    let samples_per_channel = (u32::try_from(LONGEST_PACKET.as_millis())
-        .expect("Packet duration is small enough")
-        * sampling_rate)
-        / 1000;
+    const LONGEST_PACKET_MS: u32 = 120;
+    let samples_per_channel = (LONGEST_PACKET_MS * sampling_rate) / 1000;
     usize::try_from(samples_per_channel * channels as u32)
         .expect("The samples per channel should fit in usize")
 }
 
-fn read_opus_packet<T: Read + Seek>(
-    max_frame_size: usize,
+/// Read a packet into `buffer` and return a slice of it containing the decoded samples.
+/// This returns a slice because the length of Opus packets is variable
+fn read_opus_packet<'a, T: Read + Seek>(
+    buffer: &'a mut OpusSamples,
     decoder: &mut opus::Decoder,
     stream: &mut PacketReader<T>,
-) -> Result<(), DecodeDtmfError> {
-    while let Some(packet) = stream.read_packet().transpose() {
-        match packet {
-            Ok(p) => {
-                // println!("packet data: {0:x?}", &p.data);
-                let mut output = vec![0; max_frame_size];
-                match decoder.decode(&p.data, &mut output, false) {
-                    Ok(samples_decoded) => {
-                        println!("Packet data: {0:x?}", &output[0..samples_decoded])
-                    }
-                    Err(err) => {
-                        dbg!(err);
-                    }
-                }
-            }
-            Err(err) => {
-                dbg!(err);
-            }
-        }
+) -> Result<&'a OpusSamples, DecodeDtmfError> {
+    let packet = stream
+        .read_packet()
+        .map_err(|err| {
+            DecodeDtmfError::IoError(IoError::other(format!(
+                "Failed to read OGG packet due to {err:?}"
+            )))
+        })?
+        .ok_or(DecodeDtmfError::EndOfStream)?;
+
+    match decoder.decode(&packet.data, buffer, false) {
+        Ok(sample_count) => Ok(&buffer[0..sample_count]),
+        Err(e) => Err(DecodeDtmfError::OpusDecodeError(e)),
     }
 }
 
@@ -300,7 +316,6 @@ fn print_packets<T: Read + Seek>(decoder: &mut opus::Decoder, stream: &mut Packe
     while let Some(packet) = stream.read_packet().transpose() {
         match packet {
             Ok(p) => {
-                // println!("packet data: {0:x?}", &p.data);
                 let mut output = vec![0; max_frame_size];
                 match decoder.decode(&p.data, &mut output, false) {
                     Ok(samples_decoded) => {
@@ -319,29 +334,41 @@ fn print_packets<T: Read + Seek>(decoder: &mut opus::Decoder, stream: &mut Packe
 }
 
 fn main() -> Result<(), DecodeDtmfError> {
-    // Obtained by inspecting the file with get-sampling-rate.sh
-    let sampling_rate = SamplingRate::Fullband;
-
-    let u32_sampling_rate = u32::from(sampling_rate as u16);
+    // The Opus RFC says to decode at 48 KHz if the hardware supports it
+    // regardless of the source sampling rate
+    // See https://www.rfc-editor.org/info/rfc6716/#section-2
+    const SAMPLING_RATE: SamplingRate = SamplingRate::Fullband;
     // Mono always because phone mic audio is expected. If it happens to be unexpected
     // audio (E.G a song), the decoder will just demux the stream
-    let mut decoder = opus::Decoder::new(u32_sampling_rate, opus::Channels::Mono)
+    const CHANNELS: opus::Channels = opus::Channels::Mono;
+
+    let u32_sampling_rate = u32::from(SAMPLING_RATE as u16);
+    let mut decoder = opus::Decoder::new(u32_sampling_rate, CHANNELS)
         .expect("Initialising the decoder should succeed");
     let mut stream = read_ogg(Path::new(FILE_PATH)).map_err(DecodeDtmfError::IoError)?;
 
     println!("Parsing headers");
     let stream_meta = parse_opus_headers(&mut stream).map_err(DecodeDtmfError::OpusParseError)?;
-    dbg!(stream_meta);
+    dbg!(&stream_meta);
 
-    print_packets(&mut decoder, &mut stream);
+    // print_packets(&mut decoder, &mut stream);
+    let frame_size = calc_max_frame_size(u32_sampling_rate, CHANNELS);
+    let mut buffer = vec![0; frame_size];
+    let mut signal: Vec<i16> = Vec::with_capacity(frame_size);
+    if let Some(extra_samples) = do_preskip(&stream_meta, &mut buffer, &mut decoder, &mut stream)? {
+        println!(
+            "Handled {0} extra samples after preskip.\n{extra_samples:x?}",
+            extra_samples.len()
+        );
+        signal.extend_from_slice(extra_samples.as_ref())
+    }
 
     let first_10s = decode_timeslice(
-        sampling_rate,
+        SAMPLING_RATE,
         std::time::Duration::from_secs(10),
         &mut decoder,
         &mut stream,
-    )
-    .map_err(DecodeDtmfError::SignalReadError)?;
+    )?;
     dbg!("{0:?}", first_10s);
     Ok(())
 }
