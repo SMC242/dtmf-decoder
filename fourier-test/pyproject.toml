@@ -1,0 +1,22 @@
+[project]
+name = "fourier-test"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "SMC242", email = "56912943+SMC242@users.noreply.github.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "audiofile>=1.6.1",
+    "matplotlib>=3.11.2",
+    "numpy>=2.5.3",
+    "scipy>=1.18.1",
+]
+
+[project.scripts]
+fourier-test = "fourier_test:main"
+
+[build-system]
+requires = ["uv_build>=0.12.10,<0.13.0"]
+build-backend = "uv_build"
