@@ -1,2 +1,5 @@
+from .main import main as entrypoint
+
+
 def main() -> None:
-    print("Hello from fourier-test!")
+    entrypoint()
