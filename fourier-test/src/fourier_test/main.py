@@ -1,6 +1,7 @@
 import time
 import typing
 
+from numpy.fft import fftfreq
 from scipy.fft import fft
 from scipy import signal as sci_signal
 from scipy import ndimage
@@ -12,6 +13,7 @@ import subprocess
 import sounddevice as sd
 
 FILE_PATH = "~/Downloads/dtmf-test.opus"
+SAMPLING_RATE = 48_000
 
 FFMPEG_PATH = "/usr/bin/ffmpeg"
 
@@ -32,7 +34,7 @@ def read_audio_raw(path: pathlib.Path) -> npt.NDArray[np.int16]:
             "pcm_s16le",
             # Sampling rate
             "-ar",
-            "48000",
+            str(SAMPLING_RATE),
             # Read as mono
             "-ac",
             "1",
@@ -62,31 +64,57 @@ def play_tones(tones: list[npt.NDArray[np.int16]]) -> None:
     for i, g in enumerate(tones):
         print(f"Playing group {i} with shape {g.shape}")
         sd.play(g, blocking=True)
-        time.sleep(1)
+        time.sleep(0.2)
+
+
+def plot_freqs(signal: npt.NDArray[np.int16]) -> None:
+    """
+    Do the Fourier transform on the signal and plot its frequencies
+    """
+    # From https://youtu.be/Y49XhqcZas4
+    spectrum = fft(signal)
+    freqs = fftfreq(len(signal), 1 / SAMPLING_RATE)
+
+    pos_mask = freqs >= 0
+    positive_freqs = freqs[pos_mask]
+    magnitude = (2 / len(signal)) * np.abs(spectrum[pos_mask])
+
+    plt.plot(positive_freqs, magnitude)
+    plt.xlabel("Frequency (Hz)")
+    plt.ylabel("Amplitude")
+    plt.tight_layout()
+    plt.show()
 
 
 def find_tones(signal: Signal) -> npt.NDArray[np.int16]:
     """
-    Reshape the array into tones
+    Reshape the array into tones. Resulting shape: (n_max, 9)
+    Each tone will be padded at the end with zeroes
     """
+    N_TONES = 9
+
     # A group is the region between the previous group and a jump in index
     labelled, _ = ndimage.label(signal)
+
+    # Find the 9 tones
+    # bincount counts the number of occurrences of each label
+    sizes = np.bincount(labelled.ravel())
+    sizes[0] = 0  # Ignore background
+    keep = np.argsort(sizes)[-N_TONES:]
+
+    # Remap to contiguous group numbers instead of sparse
+    remap = np.zeros(sizes.size, dtype=np.int16)
+    remap[keep] = np.arange(1, keep.size + 1)
+    labelled = remap[labelled]
+
     slices = ndimage.find_objects(labelled)
     groups = [signal[sl[0]] for sl in slices]
-    print(f"groups = {groups[:5]}")
     print(f"shapes = {[g.shape for g in groups]}")
 
-    play_tones(groups)
-    return np.stack(groups, axis=1)
-
-
-def denoise_tones(tones: npt.NDArray[np.int16]) -> npt.NDArray[np.int16]:
-    """
-    Remove tones with less than 10 samples. Expects shape (n,m)
-    """
-    MINIMUM_LENGTH = 10
-
-    pass
+    max_len = max([g.shape[0] for g in groups])
+    padded = [np.pad(g, (0, max_len - len(g))) for g in groups]
+    print(f"shapes = {[g.shape for g in padded]}")
+    return np.stack(padded, axis=0)
 
 
 def plot_signal(sig: np.ndarray) -> None:
@@ -108,10 +136,9 @@ def main() -> None:
 
     # dtmf_tones = sci_signal.find_peaks(signal)
     dtmf_tones = find_tones(signal)
-    print(dtmf_tones)
+    print(f"{dtmf_tones.shape=}")
 
-    # freqs = fft(signal)
-    # plot_signal(freqs)
+    plot_freqs(dtmf_tones[0])
 
 
 if __name__ == "__main__":
